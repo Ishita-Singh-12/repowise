@@ -1687,21 +1687,57 @@ class DeadCodeAnalyzer:
             )
         return self._overload_units.get(base_symbol_id(node), [])
 
-    def _has_inbound_use(self, node: str) -> bool:
+    def _has_inbound_use(self, node: str, _visiting: frozenset[str] = frozenset()) -> bool:
         """Whether any reachability-use edge lands on *node* or its overload set."""
         members = self._overload_unit(node)
         if members:
-            return any(self._lands_on(member) for member in members)
-        return self._lands_on(node)
+            return any(self._lands_on(member, _visiting) for member in members)
+        return self._lands_on(node, _visiting)
 
-    def _lands_on(self, node: str) -> bool:
-        """Whether any reachability-use edge lands on *node* (False if absent)."""
+    def _lands_on(self, node: str, _visiting: frozenset[str] = frozenset()) -> bool:
+        """Whether any reachability-use edge lands on *node* (False if absent).
+
+        An edge from inside *node*'s own span only counts when that caller is
+        itself live. *_visiting* holds the nodes being resolved up the call
+        chain, so a cycle of contained callers cannot recurse forever.
+        """
         if not self.graph.has_node(node):
             return False
-        return any(
-            self.graph.get_edge_data(pred, node, {}).get("edge_type")
-            in REACHABILITY_USE_EDGE_TYPES
-            for pred in self.graph.predecessors(node)
+        visiting = _visiting | {node}
+        for pred in self.graph.predecessors(node):
+            if (
+                self.graph.get_edge_data(pred, node, {}).get("edge_type")
+                not in REACHABILITY_USE_EDGE_TYPES
+            ):
+                continue
+            if not self._is_self_use(pred, node):
+                return True
+            if pred != node and pred not in visiting and self._has_inbound_use(pred, visiting):
+                return True
+        return False
+
+    def _is_self_use(self, pred: str, node: str) -> bool:
+        """Whether *pred* sits inside *node*'s own span, so its edge is no outside use.
+
+        A self-loop, or a caller declared within the symbol's own body, does
+        not keep the symbol alive on its own; such a caller decides that only
+        if it is itself used from elsewhere (see ``_lands_on``).
+
+        A predecessor whose span is missing or invalid, or that lives in
+        another file, is not treated as inside, so
+        the edge keeps counting as a use.
+        """
+        if pred == node:
+            return True
+        pred_data, node_data = self.graph.nodes[pred], self.graph.nodes[node]
+        if pred_data.get("file_path") != node_data.get("file_path"):
+            return False
+        pred_span, node_span = _symbol_span(pred_data), _symbol_span(node_data)
+        if pred_span["start_line"] is None or node_span["start_line"] is None:
+            return False
+        return (
+            node_span["start_line"] <= pred_span["start_line"]
+            and pred_span["end_line"] <= node_span["end_line"]
         )
 
     def _is_internal_candidate(
